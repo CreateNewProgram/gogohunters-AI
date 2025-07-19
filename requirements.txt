@@ -1,0 +1,9 @@
+fastapi
+python-dotenv
+pydub
+torch
+transformers
+google-generativeai
+uvicorn
+requests
+numpy
