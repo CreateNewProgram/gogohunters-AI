@@ -1,3 +1,19 @@
+# 가상환경 설치 필요
+# 아나콘다 공식 홈페이지에 자신의 이메일 작성 시 그 이메일로 다운로드 링크 들어옵니다.
+# 다운로드 후 Visual Studio Code 에서 
+# conda create -n [가상환경 이름] python=3.10 명령어 실행 / y 입력
+# conda activate [가상환경 이름] / visual 터미널에서 맨 앞에 ([가상환경 이름]) C:\gogo\llama> 이렇게 떠야함
+
+# pip install -r requirements.txt 명령어 실행 안되면 파이썬 안 깔려 있는거
+
+# Window 환경입니다.
+# 파이썬 설치 시 필독 !!! 설치 시 맨 처음 화면 때 하단 부분에 PATH 추가하는거 체크!
+# Note that Python 3.10.11 cannot be used on Windows 7 or earlier.
+# Download Windows installer (64-bit)
+
+# pip install -r requirements.txt 명령어 실행
+# winget install "FFmpeg (Essentials Build) 일반 CMD 창에서 명령어 실행 / https://www.gyan.dev/ffmpeg/builds/ <- 명령어 관련 사이트
+
 fastapi
 python-dotenv
 pydub
@@ -7,3 +23,5 @@ google-generativeai
 uvicorn
 requests
 numpy
+uvicorn[standard]
+websockets
