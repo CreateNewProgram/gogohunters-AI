@@ -1,0 +1,9 @@
+.env
+output_pcm.wav
+output.mp3
+output.wav
+received.wav
+typeast_v1_api_result.wav
+typecast_api_result.wav
+debug_typecast_v1.wav
+__pycache__
