@@ -1,2 +1,2 @@
 # gogohunters"# AI" 
-test
+tests
