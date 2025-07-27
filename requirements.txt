@@ -33,3 +33,4 @@ numpy
 uvicorn[standard]
 websockets
 faster-whisper
+uuid
