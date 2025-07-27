@@ -32,3 +32,4 @@ requests
 numpy
 uvicorn[standard]
 websockets
+faster-whisper
