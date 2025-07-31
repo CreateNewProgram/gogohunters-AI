@@ -1,12 +1,12 @@
 import os
 import io
 import time
+import uuid
 import requests
-from fastapi import FastAPI, WebSocket, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from pydub import AudioSegment
-import numpy as np
 import torch
 from faster_whisper import WhisperModel
 from google.generativeai import GenerativeModel, configure
@@ -20,8 +20,6 @@ TYPECAST_ACTOR_ID = os.getenv("TYPECAST_ACTOR_ID")
 # ─────────────── Gemini 초기화 ───────────────
 configure(api_key=GEMINI_API_KEY)
 gemini = GenerativeModel("models/gemini-2.5-flash-lite")
-
-# 사용자별 Gemini 세션 저장소
 user_sessions = {}
 
 # ─────────────── FastAPI 앱 ───────────────
@@ -31,8 +29,8 @@ app = FastAPI()
 print("🟡 Faster-Whisper 초기화 시작")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 whisper_model = WhisperModel(
-    model_size_or_path="small", 
-    device=device, 
+    model_size_or_path="small",
+    device=device,
     compute_type="int8" if device == "cuda" else "float32"
 )
 print("🟢 Faster-Whisper 로드 완료")
@@ -43,115 +41,124 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("✅ 클라이언트 연결됨")
 
+    user_id = str(uuid.uuid4())
+    chat = gemini.start_chat(history=[])
+    user_sessions[user_id] = chat
+    print(f"🟢 Gemini 세션 생성됨: {user_id}")
+
     try:
-        json_meta = await websocket.receive_json()
-        user_id = json_meta.get("user_id", "unknown")
-        timestamp = json_meta.get("timestamp", "")
-        print("✅ 메타데이터 수신:", json_meta)
+        while True:
+            try:
+                # 🎧 오디오 수신
+                audio_binary = await websocket.receive_bytes()
+                print(f"🎧 오디오 수신 ({len(audio_binary)} bytes)")
 
-        audio_binary = await websocket.receive_bytes()
-        print(f"✅ 오디오 수신 완료 ({len(audio_binary)} bytes)")
+                # 🔊 STT 전처리
+                audio = AudioSegment.from_file(io.BytesIO(audio_binary))
+                audio = audio.set_frame_rate(16000).set_channels(1)
+                audio_path = "temp_audio.wav"
+                audio.export(audio_path, format="wav")
 
-        # 오디오 전처리
-        audio = AudioSegment.from_file(io.BytesIO(audio_binary))
-        audio = audio.set_frame_rate(16000).set_channels(1)
-        audio_path = "temp_audio.wav"
-        audio.export(audio_path, format="wav")
+                segments, _ = whisper_model.transcribe(audio_path, language="ko", beam_size=1)
+                transcribed_text = "".join([seg.text for seg in segments]).strip()
+                print(f"📝 STT 결과: {transcribed_text}")
 
-        print("🟡 Faster-Whisper STT 변환 중...")
-        segments, _ = whisper_model.transcribe(audio_path, language="ko", beam_size=1)
-        transcribed_text = "".join([seg.text for seg in segments]).strip()
-        print(f"📝 STT 결과: {transcribed_text}")
+                # 💬 Gemini 응답 생성
+                prompt = f"'{transcribed_text}' 라는 발화에 대해 아이들 대상으로 이해할 수 있게 100자 내로 간결하게 한국어로 답변해줘."
+                gemini_response = chat.send_message(prompt)
+                answer_text = gemini_response.text.strip()
+                print(f"🤖 Gemini 응답: {answer_text}")
 
-        # Gemini 챗봇 세션 처리
-        if user_id not in user_sessions:
-            user_sessions[user_id] = gemini.start_chat(history=[])
-            print(f"🟢 새로운 Gemini 세션 생성: {user_id}")
-        else:
-            print(f"🟢 기존 Gemini 세션 사용: {user_id}")
-        chat = user_sessions[user_id]
-        sequence = len(chat.history) // 2
+                # 🗣️ Typecast TTS 요청
+                tts_headers = {
+                    "Authorization": f"Bearer {TYPECAST_API_KEY}",
+                    "Content-Type": "application/json"
+                }
+                tts_payload = {
+                    "text": answer_text[:300],
+                    "lang": "ko-kr",
+                    "tts_mode": "actor",
+                    "actor_id": TYPECAST_ACTOR_ID,
+                    "model_version": "latest",
+                    "xapi_audio_format": "wav",
+                    "xapi_hd": True,
+                    "volume": 100,
+                    "speed_x": 1,
+                    "tempo": 1,
+                    "pitch": 0
+                }
 
-        print("🟡 Gemini 응답 생성 중...")
-        prompt = f"'{transcribed_text}' 라는 발화에 대해 아이들 대상으로 이해 할 수 있게 100자 내로 간결하게 한국어로 답변해줘."
-        gemini_response = chat.send_message(prompt)
-        answer_text = gemini_response.text.strip()
-        print(f"📝 Gemini 응답: {answer_text}")
+                tts_response = requests.post("https://typecast.ai/api/speak", headers=tts_headers, json=tts_payload)
 
-        print("🟡 Typecast TTS 요청 중...")
-        print(f"🟡{TYPECAST_API_KEY},{TYPECAST_ACTOR_ID}")
-        tts_headers = {
-            "Authorization": f"Bearer {TYPECAST_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        tts_payload = {
-            "text": answer_text,
-            "lang": "auto",
-            "tts_mode": "actor",
-            "actor_id": TYPECAST_ACTOR_ID,
-            "model_version": "latest",
-            "xapi_audio_format": "wav",
-            "xapi_hd": True,
-            "volume": 100,
-            "speed_x": 1,
-            "tempo": 1,
-            "pitch": 0
-        }
+                # 예외 처리 추가
+                if tts_response.status_code == 400:
+                    print(f"❌ [400 Bad Request] 응답: {tts_response.text}")
+                    raise Exception("TTS 요청에 필요한 파라미터가 누락되었거나 잘못되었습니다.")
+                elif tts_response.status_code == 401:
+                    print(f"❌ [401 Unauthorized] 응답: {tts_response.text}")
+                    raise Exception("TTS 인증 실패: API 키를 확인하세요.")
+                elif tts_response.status_code == 429:
+                    print(f"❌ [429 Too Many Requests] 응답: {tts_response.text}")
+                    raise Exception("TTS 요청이 너무 많습니다. 잠시 후 다시 시도해주세요.")
+                elif not tts_response.ok:
+                    print(f"❌ [TTS 요청 실패] 상태 코드: {tts_response.status_code}, 응답: {tts_response.text}")
+                    raise Exception(f"TTS 요청 실패: {tts_response.status_code}")
 
-        tts_response = requests.post("https://typecast.ai/api/speak", headers=tts_headers, json=tts_payload)
-        tts_response.raise_for_status()
-        speak_v2_url = tts_response.json()["result"]["speak_v2_url"]
-        print(f"🟢 TTS 요청 완료: {speak_v2_url}")
+                speak_v2_url = tts_response.json()["result"]["speak_v2_url"]
 
-        max_retry = 20
-        for i in range(max_retry):
-            check = requests.get(speak_v2_url, headers=tts_headers)
-            check.raise_for_status()
-            result = check.json()["result"]
-            status = result["status"]
+                for _ in range(20):
+                    check = requests.get(speak_v2_url, headers=tts_headers)
+                    result = check.json()["result"]
+                    status = result["status"]
+                    if status == "done":
+                        audio_url = result["audio_download_url"]
+                        break
+                    elif status == "failed":
+                        raise Exception("❌ TTS 처리 실패")
+                    time.sleep(1)
+                else:
+                    raise TimeoutError("❌ TTS 대기 시간 초과")
 
-            if status == "done":
-                audio_url = result["audio_download_url"]
-                print("🟢 오디오 준비 완료:", audio_url)
+                audio_data = requests.get(audio_url).content
+
+                # 📤 응답 전송
+                await websocket.send_json({
+                    "user_id": user_id,
+                    "text": transcribed_text,
+                    "answer": answer_text,
+                    "timestamp": time.time()
+                })
+                await websocket.send_bytes(audio_data)
+                print("✅ 응답 전송 완료")
+
+            except WebSocketDisconnect:
+                print("🔴 클라이언트 연결 해제됨 (WebSocketDisconnect)")
                 break
-            elif status == "failed":
-                raise Exception("❌ TTS 실패")
-            else:
-                print(f"⏳ TTS 대기 중... ({i+1}/{max_retry}) status={status}")
-                time.sleep(1)
-        else:
-            raise TimeoutError("❌ TTS 응답이 제한 시간 내 도착하지 않았습니다.")
 
-        audio_data = requests.get(audio_url)
-        print(f"✅ 오디오 다운로드 완료 ({len(audio_data.content)} bytes)")
-
-        with open("typecast_api_result.wav", "wb") as f:
-            f.write(audio_data.content)
-        print("📝 디버그용 오디오 저장 완료: typecast_api_result.wav")
-
-        response_meta = {
-            "user_id": user_id,
-            "sequence": sequence,
-            "timestamp": timestamp,
-            "answer": answer_text
-        }
-        await websocket.send_json(response_meta)
-        await websocket.send_bytes(audio_data.content)
-        print("✅ WebSocket 응답 전송 완료")
-
-    except Exception as e:
-        print(f"❌ 예외 발생: {e}")
-        await websocket.send_text("❌ 서버 오류: " + str(e))
+            except Exception as e_inner:
+                print(f"⚠️ 처리 중 오류 발생: {e_inner}")
+                if websocket.client_state.name == "CONNECTED":
+                    try:
+                        await websocket.send_text("❌ 오류: " + str(e_inner))
+                    except Exception as send_fail:
+                        print(f"❌ 오류 메시지 전송 실패: {send_fail}")
+                break
 
     finally:
-        await websocket.close()
-        print("🔴 클라이언트 연결 종료")
+        if websocket.client_state.name != "DISCONNECTED":
+            try:
+                await websocket.close()
+                print("🔒 WebSocket 닫힘")
+            except Exception as close_error:
+                print(f"⚠️ WebSocket 종료 실패: {close_error}")
 
-# ─────────────── 세션 목록 보기 ───────────────
+        print("🧹 세션 종료:", user_id)
+        user_sessions.pop(user_id, None)
+
+# ─────────────── 세션 목록 조회 ───────────────
 @app.get("/sessions")
 async def sessions(request: Request):
     user_id = request.query_params.get("user_id")
-
     if user_id is None:
         return JSONResponse(content={
             "active_sessions_count": len(user_sessions),
@@ -162,32 +169,27 @@ async def sessions(request: Request):
     if session is None:
         return JSONResponse(status_code=404, content={"error": "세션을 찾을 수 없습니다."})
 
-    history = []
     try:
+        history = []
         for item in session.history:
             role = getattr(item, "role", "unknown")
-
-            if hasattr(item, "parts"):
-                if isinstance(item.parts, list):
-                    content = "\n".join(str(p) for p in item.parts)
-                else:
-                    content = str(item.parts)
-            else:
-                content = "내용 없음"
-
+            content = (
+                "\n".join(str(p) for p in item.parts)
+                if hasattr(item, "parts") and isinstance(item.parts, list)
+                else str(getattr(item, "parts", "내용 없음"))
+            )
             history.append({"role": role, "content": content})
+        return JSONResponse(content={
+            "user_id": user_id,
+            "message_count": len(history),
+            "chat_history": history
+        })
     except Exception as e:
         return JSONResponse(status_code=500, content={
             "error": "히스토리 파싱 중 오류 발생",
             "details": str(e)
         })
 
-    return JSONResponse(content={
-        "user_id": user_id,
-        "message_count": len(history),
-        "chat_history": history
-    })
-
-
+# 실행 명령 예시
 # uvicorn main:app --reload --port 8090
-#  cloudflared tunnel --url http://localhost:8090
+# cloudflared tunnel --url http://localhost:8090
