@@ -3,13 +3,19 @@ import io
 import time
 import uuid
 import requests
+import faiss
+import fitz
+import numpy as np
+import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from pydub import AudioSegment
-import torch
 from faster_whisper import WhisperModel
 from google.generativeai import GenerativeModel, configure
+from sentence_transformers import SentenceTransformer
+
+from pathlib import Path
 
 # ─────────────── 환경 변수 로드 ───────────────
 load_dotenv()
@@ -34,7 +40,58 @@ whisper_model = WhisperModel(
     compute_type="int8" if device == "cuda" else "float32"
 )
 print("🟢 Faster-Whisper 로드 완료")
+# ─────────────── RAG 환경 불러오기 ───────────────
+# 🔁 사전 준비: PDF 문서 불러오기
+def extract_text_from_pdfs(pdf_dir_path="pdfs"):
+    pdf_dir = Path(pdf_dir_path)
+    docs = []
+    for pdf_file in pdf_dir.glob("*.pdf"):
+        doc = fitz.open(pdf_file)
+        text = ""
+        for page in doc:
+            text += page.get_text()
+        docs.append({
+            "filename": pdf_file.name,
+            "content": text
+        })
+        doc.close()
+    return docs
 
+# 🔁 사전 준비: FAISS 인덱스 생성
+def build_faiss_index(docs, model):
+    texts = [doc["content"][:2048] for doc in docs]
+    embeddings = model.encode(texts, convert_to_numpy=True)
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(embeddings)
+    return index, embeddings
+
+# 🔍 문서 검색
+def search_similar_docs(query, index, docs, model, top_k=3):
+    query_emb = model.encode([query], convert_to_numpy=True)
+    D, I = index.search(query_emb, top_k)
+    results = [docs[i]["content"][:1000] for i in I[0]]
+    return "\n\n".join(results)
+
+# 🧠 Gemini RAG 응답
+def ask_with_context(user_input, context_text):
+    prompt = f"""
+아래는 사용자의 질문과 관련된 참고 문서입니다. 이 문서를 바탕으로 질문에 답변해 주세요.
+----- 참고 문서 -----
+{context_text}
+---------------------
+질문: {user_input}
+아이들도 이해할 수 있도록 100자 이내로 쉽고 정확하게 설명해 주세요.
+"""
+    response = gemini.generate_content(prompt)
+    return response.text.strip()
+
+# 📦 서버 구동 시 메모리에 로드
+print("🟡 RAG 초기화 시작")
+docs = extract_text_from_pdfs("pdfs")
+model = SentenceTransformer("snunlp/KR-SBERT-V40K-klueNLI-augSTS")
+index, embeddings = build_faiss_index(docs, model)
+print("🟢 RAG 로드 완료")
 # ─────────────── WebSocket 엔드포인트 ───────────────
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -64,9 +121,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 print(f"📝 STT 결과: {transcribed_text}")
 
                 # 💬 Gemini 응답 생성
-                prompt = f"'{transcribed_text}' 라는 발화에 대해 아이들 대상으로 이해할 수 있게 100자 내로 간결하게 한국어로 답변해줘."
-                gemini_response = chat.send_message(prompt)
-                answer_text = gemini_response.text.strip()
+                context_text = search_similar_docs(transcribed_text, index, docs, model)
+                answer_text = ask_with_context(transcribed_text, context_text)
                 print(f"🤖 Gemini 응답: {answer_text}")
 
                 # 🗣️ Typecast TTS 요청

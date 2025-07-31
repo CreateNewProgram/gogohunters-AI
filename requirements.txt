@@ -21,7 +21,6 @@
 # winget install "FFmpeg (Essentials Build) 일반 CMD 창에서 명령어 실행 / https://www.gyan.dev/ffmpeg/builds/ <- FFmpeg 명령어 관련 사이트
 
 fastapi
-time
 python-dotenv
 pydub
 torch
@@ -30,7 +29,11 @@ google-generativeai
 uvicorn
 requests
 numpy
-uvicorn[standard]
+uvicorn
 websockets
 faster-whisper
 uuid
+PyMuPDF
+faiss-cpu
+sentence-transformers
+tqdm
