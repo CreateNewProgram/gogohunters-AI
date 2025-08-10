@@ -18,19 +18,23 @@ from google.generativeai import GenerativeModel, configure
 from sentence_transformers import SentenceTransformer
 from pathlib import Path
 
+
 # ─────────────── 환경 변수 로드 ───────────────
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TYPECAST_API_KEY = os.getenv("TYPECAST_API_KEY")
 TYPECAST_ACTOR_ID = os.getenv("TYPECAST_ACTOR_ID")
 
+
 # ─────────────── Gemini 초기화 ───────────────
 configure(api_key=GEMINI_API_KEY)
 gemini = GenerativeModel("models/gemini-2.5-flash-lite")
 user_sessions = {}
 
+
 # ─────────────── FastAPI 앱 ───────────────
 app = FastAPI()
+
 
 # ─────────────── Faster-Whisper 초기화 ───────────────
 print("🟡 Faster-Whisper 초기화 시작")
@@ -41,6 +45,7 @@ whisper_model = WhisperModel(
     compute_type="int8" if device == "cuda" else "float32"
 )
 print("🟢 Faster-Whisper 로드 완료")
+
 
 # ─────────────── RAG 설정 (경로/파라미터) ───────────────
 PDF_DIR = Path("pdfs")
@@ -54,6 +59,7 @@ CHUNK_SIZE = 800
 CHUNK_OVERLAP = 200
 TOP_K = 5
 MAX_CTX_CHARS = 2000
+
 
 # ─────────────── 유틸: PDF 텍스트 추출 ───────────────
 def extract_text_from_pdfs(pdf_dir_path="pdfs"):
@@ -75,6 +81,7 @@ def extract_text_from_pdfs(pdf_dir_path="pdfs"):
             print(f"⚠️ PDF 파싱 실패: {pdf_file.name} - {e}")
     return docs
 
+
 # ─────────────── 유틸: 텍스트 청킹 ───────────────
 def chunk_text(text, chunk_size=800, overlap=200):
     chunks = []
@@ -90,6 +97,7 @@ def chunk_text(text, chunk_size=800, overlap=200):
         start = max(0, end - overlap)
     return chunks
 
+
 # ─────────────── 유틸: 코퍼스 지문 ───────────────
 def compute_corpus_fingerprint(pdf_dir: Path) -> str:
     """파일명, 크기, 수정시간으로 해시 생성 (내용 변경 감지)"""
@@ -102,6 +110,7 @@ def compute_corpus_fingerprint(pdf_dir: Path) -> str:
         h.update(str(stat.st_size).encode("utf-8"))
         h.update(str(int(stat.st_mtime)).encode("utf-8"))
     return h.hexdigest()
+
 
 # ─────────────── 인덱스 저장/로드 ───────────────
 def save_index(index, chunks_meta, fingerprint: str, params: dict):
@@ -127,6 +136,7 @@ def load_index():
     except Exception as e:
         print("⚠️ 인덱스 로드 실패:", e)
         return None, None, None, None
+
 
 # ─────────────── FAISS 빌드 ───────────────
 def build_faiss_index(docs, model, chunk_size=800, overlap=200):
@@ -156,6 +166,7 @@ def build_faiss_index(docs, model, chunk_size=800, overlap=200):
     index.add(embeddings.astype(np.float32))
     return index, chunks_meta, embeddings
 
+
 # ─────────────── 검색 ───────────────
 def search_similar_docs(query, index, chunks_meta, model, top_k=5, max_total_chars=2000):
     if not chunks_meta:
@@ -175,6 +186,7 @@ def search_similar_docs(query, index, chunks_meta, model, top_k=5, max_total_cha
         if total_len >= max_total_chars:
             break
     return "\n\n".join(picked)
+
 
 # ─────────────── Gemini RAG 응답 ───────────────
 def ask_with_context(user_input, context_text):
@@ -233,10 +245,12 @@ def init_rag(force_rebuild: bool = False):
     print(f"🟢 RAG 로드 완료 (문서 {len(docs)}개, 청크 {len(chunks_meta)}개)")
     return index, chunks_meta
 
+
 # ─────────────── 전역 RAG 핸들 ───────────────
 # 주의: 검색 때 쓸 SentenceTransformer 모델은 한 번만 로드(메모리 상주)
 rag_model = SentenceTransformer(EMBED_MODEL_NAME)
 faiss_index, chunks_meta = init_rag(force_rebuild=False)
+
 
 # ─────────────── WebSocket 엔드포인트 ───────────────
 @app.websocket("/ws")
@@ -361,6 +375,7 @@ async def websocket_endpoint(websocket: WebSocket):
         print("🧹 세션 종료:", user_id)
         user_sessions.pop(user_id, None)
 
+
 # ─────────────── 세션 목록 조회 ───────────────
 @app.get("/sessions")
 async def sessions(request: Request):
@@ -395,6 +410,7 @@ async def sessions(request: Request):
             "error": "히스토리 파싱 중 오류 발생",
             "details": str(e)
         })
+
 
 # 실행 명령 예시
 # uvicorn main:app --reload --port 8090
