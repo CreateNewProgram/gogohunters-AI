@@ -17,7 +17,9 @@ from faster_whisper import WhisperModel
 from google.generativeai import GenerativeModel, configure
 from sentence_transformers import SentenceTransformer
 from pathlib import Path
-
+from rapidfuzz import process, fuzz
+from jamo import h2j, j2hcj
+from typing import Tuple
 
 # ─────────────── 환경 변수 로드 ───────────────
 load_dotenv()
@@ -39,13 +41,90 @@ app = FastAPI()
 # ─────────────── Faster-Whisper 초기화 ───────────────
 print("🟡 Faster-Whisper 초기화 시작")
 device = "cuda" if torch.cuda.is_available() else "cpu"
-whisper_model = WhisperModel(
-    model_size_or_path="small",
-    device=device,
-    compute_type="int8" if device == "cuda" else "float32"
-)
-print("🟢 Faster-Whisper 로드 완료")
+# 정확도 선호 시: GPU에서는 float16 권장 (int8는 속도/메모리 이점, 정확도 약간↓)
+compute_type = "float16" if device == "cuda" else "float32"
 
+whisper_model = WhisperModel(
+    model_size_or_path="medium",
+    device=device,
+    compute_type=compute_type
+)
+print(f"🟢 Faster-Whisper 로드 완료 (device={device}, compute_type={compute_type})")
+
+# ─────────────── [NEW] 도메인 단어/바이어싱/교정 ───────────────
+# 표준 표기 + 자주 틀리는 분절/철자/연음 형태까지 포함
+DOMAIN_TERMS = [
+    "고고헌터즈", "고고 헌터즈", "Gogo Hunters",
+    "우항리", "Uhang-ri",
+    "타미", "Tami",
+    "공룡알", "공룡 알", "공룡알 화석", "공룡알화석"
+]
+# n-gram 규칙: 띄어쓰기 교정(필요 시 추가)
+NGRAM_FIXES = {
+    "공룡 알": "공룡알",
+    "고고 헌터즈": "고고헌터즈"
+}
+
+def to_jamo(s: str) -> str:
+    return j2hcj(h2j(s))
+
+TERMS_JAMO = [to_jamo(x) for x in DOMAIN_TERMS]
+
+def correct_domain_terms(text: str, threshold: int = 90) -> str:
+    """단어 단위 근사 매칭 + 간단 n-gram 교정"""
+    tokens = text.split()
+    out = []
+    for w in tokens:
+        jw = to_jamo(w)
+        res = process.extractOne(jw, TERMS_JAMO, scorer=fuzz.WRatio)
+        if res and res[1] >= threshold:
+            idx = TERMS_JAMO.index(res[0])
+            cand = DOMAIN_TERMS[idx]
+            out.append(cand.replace(" ", ""))  # 표준 표기를 무조건 붙임 형태로 수렴
+        else:
+            out.append(w)
+    fixed = " ".join(out)
+    for k, v in NGRAM_FIXES.items():
+        fixed = fixed.replace(k, v)
+    return fixed
+
+# Whisper 바이어싱 문맥 (짧은 자연문 권장)
+INITIAL_PROMPT = (
+    "이 콘텐츠는 고고헌터즈 프로젝트와 우항리 공룡알 화석 발굴에 관한 안내입니다. "
+    "등장인물 타미가 설명합니다."
+)
+
+# ─────────────── (함수화) Whisper 전사 + 교정 ───────────────
+def transcribe_and_correct(
+    audio_path: str,
+    *,
+    model: WhisperModel = whisper_model,
+    initial_prompt: str = INITIAL_PROMPT,
+    language: str = "ko",
+    vad_filter: bool = True,
+    beam_size: int = 5,
+    temperature: Tuple[float, ...] = (0.0, 0.2, 0.4),
+    word_timestamps: bool = False,
+    condition_on_previous_text: bool = False,
+    correction_threshold: int = 90,
+) -> Tuple[str, str]:
+    """
+    Whisper 전사 → 도메인 교정까지 수행하여 (raw_text, corrected_text) 반환
+    """
+    segments, _ = model.transcribe(
+        audio_path,
+        task="transcribe",
+        language=language,
+        initial_prompt=initial_prompt,
+        vad_filter=vad_filter,
+        beam_size=beam_size,
+        temperature=list(temperature),
+        word_timestamps=word_timestamps,
+        condition_on_previous_text=condition_on_previous_text,
+    )
+    raw_text = "".join([seg.text for seg in segments]).strip()
+    corrected_text = correct_domain_terms(raw_text, threshold=correction_threshold)
+    return raw_text, corrected_text
 
 # ─────────────── RAG 설정 (경로/파라미터) ───────────────
 PDF_DIR = Path("pdfs")
@@ -140,12 +219,6 @@ def load_index():
 
 # ─────────────── FAISS 빌드 ───────────────
 def build_faiss_index(docs, model, chunk_size=800, overlap=200):
-    """
-    반환:
-      index: FAISS IndexFlatL2
-      chunks_meta: [{doc_id, filename, text}]
-      embeddings: np.ndarray (num_chunks, dim)
-    """
     chunks_meta = []
     for i, doc in enumerate(docs):
         for ch in chunk_text(doc["content"], chunk_size=chunk_size, overlap=overlap):
@@ -191,8 +264,12 @@ def search_similar_docs(query, index, chunks_meta, model, top_k=5, max_total_cha
 # ─────────────── Gemini RAG 응답 ───────────────
 def ask_with_context(user_input, context_text):
     prompt = f"""
-안녕하세요! 당신은 타미 선생님이에요.
-아래는 사용자의 질문과 관련된 참고 문서입니다. 당신은 이 문서를 바탕으로 질문에 대해 아이들이 이해할 수 있도록 쉽고 친절하게, **150자 이내로** 설명해 줄 거예요.
+# 역할
+당신은 '타미 선생님'입니다. 타미 선생님은 친절하고 똑똑하며, 아이들의 눈높이에 맞춰 어려운 내용을 쉽게 설명해 주는 선생님입니다.
+
+# 지시사항
+1. 오직 '참고 문서'의 내용만을 활용하여 질문에 답변하세요.
+2. 답변은 아이들이 이해하기 쉽도록 친근한 말투로, 최대 **150자 이내**로 작성하세요.
 
 ----- 참고 문서 -----
 {context_text}
@@ -277,15 +354,27 @@ async def websocket_endpoint(websocket: WebSocket):
                 audio_path = "temp_audio.wav"
                 audio.export(audio_path, format="wav")
 
-                segments, _ = whisper_model.transcribe(audio_path, language="ko", beam_size=1)
-                transcribed_text = "".join([seg.text for seg in segments]).strip()
-                print(f"📝 STT 결과: {transcribed_text}")
-
-                # 💬 Gemini RAG: 검색 → 응답
-                context_text = search_similar_docs(
-                    transcribed_text, faiss_index, chunks_meta, rag_model, top_k=TOP_K, max_total_chars=MAX_CTX_CHARS
+                # 🔹 (함수 사용) Whisper 전사 + 교정
+                raw_text, corrected_text = transcribe_and_correct(
+                    audio_path,
+                    model=whisper_model,
+                    initial_prompt=INITIAL_PROMPT,
+                    language="ko",
+                    vad_filter=True,
+                    beam_size=5,
+                    temperature=(0.0, 0.2, 0.4),
+                    word_timestamps=False,               # 필요 시 True
+                    condition_on_previous_text=False,
+                    correction_threshold=90,
                 )
-                answer_text = ask_with_context(transcribed_text, context_text)
+                print(f"📝 STT 결과(raw): {raw_text}")
+                print(f"🛠️ STT 결과(corrected): {corrected_text}")
+
+                # 💬 Gemini RAG: 검색 → 응답 (교정된 텍스트로 검색/질의)
+                context_text = search_similar_docs(
+                    corrected_text, faiss_index, chunks_meta, rag_model, top_k=TOP_K, max_total_chars=MAX_CTX_CHARS
+                )
+                answer_text = ask_with_context(corrected_text, context_text)
                 print(f"🤖 Gemini 응답: {answer_text}")
 
                 # 🗣️ Typecast TTS 요청
@@ -342,10 +431,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 audio_data = requests.get(audio_url).content
 
-                # 📤 응답 전송
+                # 📤 응답 전송 (원문/교정문 둘 다 포함)
                 await websocket.send_json({
                     "user_id": user_id,
-                    "text": transcribed_text,
+                    "text_raw": raw_text,
+                    "text_corrected": corrected_text,
                     "answer": answer_text,
                     "timestamp": time.time()
                 })
@@ -414,6 +504,5 @@ async def sessions(request: Request):
 
 
 # 실행 명령 예시
-# test
 # uvicorn main:app --reload --port 8090
 # cloudflared tunnel --url http://localhost:8090
